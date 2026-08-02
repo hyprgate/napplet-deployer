@@ -283,7 +283,7 @@
   <header class="topbar">
     <div>
       <p class="eyebrow">NIP-5D deploy</p>
-      <h1>Napplet Deployer</h1>
+      <h1>App Deployer</h1>
     </div>
     <div class="runtime">
       <span class:ok={pubkey !== null}>{pubkey ? 'identity ready' : 'identity unknown'}</span>
