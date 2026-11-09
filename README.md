@@ -4,9 +4,11 @@
 > Do not push commits to this standalone napplet repository; direct changes are overwritten by Hyprgate's mirror workflow.
 <!-- HYPRGATE NAPPLET MIRROR NOTICE:END -->
 
-# Napplet Deployer
+# App Deployer
 
-Sandboxed NIP-5D napplet for deploying another napplet's built `index.html`.
+Sandboxed NIP-5D napplet for deploying another napplet's built `index.html`. It's
+tracked in this repo at `napplets/napplet-deployer`; the standalone repository is a
+generated, read-only mirror.
 
 The deployer:
 
@@ -15,7 +17,7 @@ The deployer:
 - computes the NIP-5A single-file `/index.html` `path` hash and aggregate `x`
   hash;
 - uploads the HTML through NAP-UPLOAD with a Blossom rail hint;
-- publishes a kind `35129` named-napplet event through the runtime relay API.
+- publishes a kind `35129` named-napplet event through NAP-OUTBOX.
 
 The UI intentionally shows the current NAP-UPLOAD limitation: before upload, a
 napplet cannot know which Blossom server the runtime will target, and it cannot
@@ -25,8 +27,8 @@ tags from returned URLs.
 ## Develop
 
 ```bash
-pnpm --filter @hyprgate/napp-napplet-deployer dev
-pnpm --filter @hyprgate/napp-napplet-deployer test
-pnpm --filter @hyprgate/napp-napplet-deployer type-check
-pnpm --filter @hyprgate/napp-napplet-deployer build
+pnpm --filter ./napplets/napplet-deployer dev
+pnpm --filter ./napplets/napplet-deployer test
+pnpm --filter ./napplets/napplet-deployer type-check
+pnpm --filter ./napplets/napplet-deployer build
 ```

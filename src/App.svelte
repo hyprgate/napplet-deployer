@@ -1,15 +1,20 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { identity, outbox, upload, type NostrEvent, type UploadResult } from '@napplet/sdk';
+  import * as nip19 from 'nostr-tools/nip19';
   import {
     NAPPLET_DTAG_RE,
     NAPPLET_HTML_MIME,
+    DEPLOY_BLOCKER_TEXT,
+    deployBlocker,
     deployNappletHtml,
+    describeDeployFailure,
     nappletManifestAddress,
     nappletManifestNaddr,
     prepareNappletHtml,
     serverTagsFromUploadResult,
     validateHtmlFile,
+    type DeployFailure,
     type NappletHtmlMetadata,
     type PreparedNappletHtml,
     type RuntimeUploadInfo,
@@ -40,23 +45,27 @@
   let relays = $state<RelayRow[]>([]);
   let pubkey = $state<string | null>(null);
   let step = $state<Step>('idle');
-  let status = $state('Choose a built napplet index.html file.');
+  let status = $state('');
   let error = $state<string | null>(null);
+  let failure = $state<DeployFailure | null>(null);
   let dTag = $state('');
   let title = $state('');
   let description = $state('');
   let dragActive = $state(false);
   let copiedResultId = $state<string | null>(null);
 
-  const canDeploy = $derived(
-    selectedFile !== null
-      && prepared !== null
-      && dTag.trim().length > 0
-      && NAPPLET_DTAG_RE.test(dTag.trim())
-      && step !== 'hashing'
-      && step !== 'uploading'
-      && step !== 'publishing',
-  );
+  const busy = $derived(step === 'hashing' || step === 'uploading' || step === 'publishing');
+  const blocker = $derived(deployBlocker({
+    hasFile: selectedFile !== null,
+    prepared: prepared !== null,
+    dTag,
+    busy,
+  }));
+  const canDeploy = $derived(blocker === null);
+  const blockerText = $derived(blocker && blocker !== 'busy' ? DEPLOY_BLOCKER_TEXT[blocker] : '');
+  const dTagInvalid = $derived(dTag.trim().length > 0 && !NAPPLET_DTAG_RE.test(dTag.trim()));
+  /** Which of the three steps someone is on. */
+  const currentStep = $derived(publishedEvent ? 4 : prepared ? (blocker === null || busy ? 3 : 2) : 1);
 
   const uploadRails = $derived(uploadInfo?.rails ?? []);
   const blossomKnown = $derived(uploadRails.some((rail) => rail.rail === 'blossom' && rail.enabled));
@@ -91,8 +100,8 @@
       {
         id: 'publisher',
         label: 'Publisher',
-        value: publishedEvent.pubkey,
-        display: shortHash(publishedEvent.pubkey),
+        value: nip19.npubEncode(publishedEvent.pubkey),
+        display: shortHash(nip19.npubEncode(publishedEvent.pubkey)),
       },
       {
         id: 'blob-url',
@@ -130,6 +139,7 @@
 
   async function setFile(file: File): Promise<void> {
     error = null;
+    failure = null;
     status = 'Reading index.html...';
     step = 'hashing';
     selectedFile = file;
@@ -141,7 +151,7 @@
     if (fileError) {
       prepared = null;
       error = fileError;
-      status = 'Choose a built napplet index.html file.';
+      status = '';
       step = 'error';
       return;
     }
@@ -149,7 +159,7 @@
       const next = await prepareNappletHtml(file);
       prepared = next;
       applyMetadata(next.metadata);
-      status = 'Ready to deploy one HTML artifact through the runtime upload rail.';
+      status = 'Ready to deploy.';
       step = 'ready';
     } catch (caught) {
       prepared = null;
@@ -181,6 +191,7 @@
   async function deploy(): Promise<void> {
     if (!selectedFile || !canDeploy) return;
     error = null;
+    failure = null;
     publishedEvent = null;
     uploadResult = null;
     publishRelayHints = [];
@@ -215,11 +226,11 @@
       publishedEvent = result.event;
       publishRelayHints = result.relayHints;
       step = 'success';
-      status = 'Napplet deployed.';
+      status = 'Deployed.';
     } catch (caught) {
-      error = caught instanceof Error ? caught.message : 'Deploy failed';
+      failure = describeDeployFailure(caught, uploadResult?.ok === true);
       step = 'error';
-      status = 'Deploy failed.';
+      status = '';
     }
   }
 
@@ -234,7 +245,8 @@
     title = '';
     description = '';
     error = null;
-    status = 'Choose a built napplet index.html file.';
+    failure = null;
+    status = '';
     step = 'idle';
   }
 
@@ -262,9 +274,12 @@
   }
 
   async function writeClipboard(value: string): Promise<void> {
-    if (navigator.clipboard?.writeText) {
+    // The sandbox usually refuses the async API, so a rejection falls through to execCommand.
+    try {
       await navigator.clipboard.writeText(value);
       return;
+    } catch {
+      // Fall through.
     }
     const textarea = document.createElement('textarea');
     textarea.value = value;
@@ -272,6 +287,7 @@
     textarea.style.position = 'fixed';
     textarea.style.left = '-9999px';
     document.body.append(textarea);
+    textarea.focus();
     textarea.select();
     const copied = document.execCommand('copy');
     textarea.remove();
@@ -282,34 +298,71 @@
 <main>
   <header class="topbar">
     <div>
-      <p class="eyebrow">NIP-5D deploy</p>
       <h1>App Deployer</h1>
+      <p class="lede">Publish a built single-file NIP-5D napplet to Nostr.</p>
     </div>
-    <div class="runtime">
-      <span class:ok={pubkey !== null}>{pubkey ? 'identity ready' : 'identity unknown'}</span>
-      <span class:ok={blossomKnown}>{blossomKnown ? 'blossom rail' : 'upload rail unknown'}</span>
-    </div>
+    <ul class="runtime" aria-label="Runtime status">
+      <li class:ok={pubkey !== null}>{pubkey ? 'Identity ready' : 'No identity'}</li>
+      <li class:ok={blossomKnown}>{blossomKnown ? 'Blossom upload available' : 'Upload rail unknown'}</li>
+    </ul>
   </header>
 
+  <ol class="steps" aria-label="Steps">
+    {#each ['Choose index.html', 'Check the details', 'Deploy'] as label, index}
+      <li class:done={currentStep > index + 1} class:current={currentStep === index + 1} aria-current={currentStep === index + 1 ? 'step' : undefined}>
+        <span class="step-number" aria-hidden="true">{currentStep > index + 1 ? '✓' : index + 1}</span>{label}
+      </li>
+    {/each}
+  </ol>
+
+  {#if publishedEvent}
+    <section class="panel result-panel" aria-labelledby="result-title" data-testid="deploy-result">
+      <div class="panel-head">
+        <h2 id="result-title">Deployed {title.trim() || dTag.trim()}</h2>
+        <button type="button" class="secondary" onclick={reset}>Deploy another</button>
+      </div>
+      <p class="note">Share the NIP-19 entity below. Anyone can open your app with it.</p>
+      <dl class="facts result">
+        {#each resultRows as row}
+          <div class:primary-result={row.primary}>
+            <dt>{row.label}</dt>
+            <dd title={row.value || row.display}>{row.display}</dd>
+            <button
+              type="button"
+              class="copy-button"
+              disabled={!row.value}
+              aria-label="Copy {row.label}"
+              onclick={() => { void copyResult(row); }}
+            >{copiedResultId === row.id ? 'Copied' : 'Copy'}</button>
+          </div>
+        {/each}
+      </dl>
+    </section>
+  {/if}
+
+  {#if !publishedEvent}
   <section class="workspace">
     <section
       class="dropzone"
       class:active={dragActive}
+      class:has-file={selectedFile !== null}
       ondragenter={(event) => { event.preventDefault(); dragActive = true; }}
       ondragover={(event) => { event.preventDefault(); dragActive = true; }}
       ondragleave={() => { dragActive = false; }}
       ondrop={onDrop}
       aria-label="HTML upload drop zone"
     >
-      <div class="drop-mark" aria-hidden="true">/index.html</div>
-      <h2>{selectedFile ? selectedFile.name : 'Drop built index.html'}</h2>
-      <p>
-        One sandboxed napplet artifact. The runtime owns Blossom upload, signer prompts, and relay publish.
-      </p>
+      {#if selectedFile}
+        <h2>{selectedFile.name}</h2>
+        {#if prepared}<p>{formatBytes(prepared.size)}, ready to check.</p>{/if}
+      {:else}
+        <h2>Drop your built index.html here</h2>
+        <p>Build your app first, then use the single file from its output folder, usually <code>dist/index.html</code>.</p>
+      {/if}
       <div class="drop-actions">
-        <button type="button" class="primary" onclick={chooseFile}>Choose file</button>
+        <button type="button" class={selectedFile ? 'secondary' : 'primary'} onclick={chooseFile}>{selectedFile ? 'Choose another' : 'Choose file'}</button>
         {#if selectedFile}
-          <button type="button" class="secondary" onclick={reset}>Reset</button>
+          <button type="button" class="secondary" onclick={reset}>Clear</button>
         {/if}
       </div>
       <input
@@ -321,442 +374,204 @@
         aria-hidden="true"
         tabindex="-1"
       />
+      {#if error}<p class="error" role="alert" data-testid="deploy-file-error">{error}</p>{/if}
     </section>
 
     <section class="panel">
       <div class="panel-head">
-        <h2>Manifest</h2>
-        <span class={`step ${step}`}>{step}</span>
+        <h2>Details</h2>
       </div>
 
       <label>
         <span>Napplet d-tag</span>
-        <input bind:value={dTag} placeholder="my-napplet" class:invalid={dTag.length > 0 && !NAPPLET_DTAG_RE.test(dTag)} />
+        <input
+          bind:value={dTag}
+          placeholder="my-napplet"
+          class:invalid={dTagInvalid}
+          aria-invalid={dTagInvalid ? 'true' : undefined}
+          aria-describedby="d-tag-help"
+          spellcheck="false"
+          autocomplete="off"
+        />
+        <small id="d-tag-help" class:field-error={dTagInvalid}>
+          {#if dTagInvalid}Use lowercase letters and numbers, plus . _ : or -, starting with a letter or number.{:else}Deploying again with the same d-tag replaces the earlier version.{/if}
+        </small>
       </label>
       <label>
-        <span>Title tag</span>
+        <span>Title</span>
         <input bind:value={title} placeholder="Optional display title" />
       </label>
       <label>
-        <span>Description tag</span>
-        <textarea bind:value={description} placeholder="Optional short description"></textarea>
+        <span>Description</span>
+        <textarea bind:value={description} placeholder="Optional short description" rows="2"></textarea>
       </label>
 
       {#if prepared}
-        <dl class="facts">
-          <div><dt>HTML bytes</dt><dd>{formatBytes(prepared.size)}</dd></div>
-          <div><dt>HTML sha256</dt><dd>{shortHash(prepared.htmlSha256)}</dd></div>
-          <div><dt>Aggregate x</dt><dd>{shortHash(prepared.aggregateHash)}</dd></div>
-          <div><dt>Requires</dt><dd>{prepared.metadata.requires.length ? prepared.metadata.requires.join(', ') : 'none detected'}</dd></div>
-        </dl>
+        <p class="requires"><span>Needs</span> {prepared.metadata.requires.length ? prepared.metadata.requires.join(', ') : 'no declared domains'}</p>
+        <details class="hashes">
+          <summary>Hashes</summary>
+          <dl class="facts">
+            <div><dt>HTML sha256</dt><dd title={prepared.htmlSha256}>{shortHash(prepared.htmlSha256)}</dd></div>
+            <div><dt>Aggregate x</dt><dd title={prepared.aggregateHash}>{shortHash(prepared.aggregateHash)}</dd></div>
+          </dl>
+        </details>
       {/if}
 
       <button type="button" class="deploy" disabled={!canDeploy} onclick={deploy}>
-        {step === 'uploading' ? 'Uploading' : step === 'publishing' ? 'Publishing' : 'Deploy napplet'}
+        {step === 'uploading' ? 'Uploading…' : step === 'publishing' ? 'Publishing…' : 'Deploy napplet'}
       </button>
+      {#if blockerText}<p class="note" data-testid="deploy-blocker">{blockerText}</p>{/if}
 
-      <p class="status" role="status">{status}</p>
-      {#if error}<p class="error" role="alert">{error}</p>{/if}
+      {#if status && !blockerText}<p class="status" role="status">{status}</p>{/if}
+      {#if failure}
+        <div class="failure" role="alert" data-testid="deploy-failure">
+          <strong>{failure.title}</strong>
+          <p>{failure.hint}</p>
+          <small>Runtime said: {failure.detail}</small>
+        </div>
+      {/if}
     </section>
   </section>
 
-  <section class="grid">
-    <article>
-      <h2>Upload rail</h2>
-      <div class="rows">
-        {#if serverRows.length > 0}
+  {/if}
+
+  <details class="panel where" open={publishedEvent !== null} data-testid="deploy-destinations">
+    <summary>Where this goes</summary>
+    <div class="grid">
+      <article>
+        <h3>File upload</h3>
+        <div class="rows">
           {#each serverRows as server}
             <div class="row ok"><span>{server}</span><strong>stored</strong></div>
+          {:else}
+            <div class="row"><span>Your Blossom servers</span><strong>runtime picks</strong></div>
           {/each}
-        {:else}
-          <div class="row pending"><span>Blossom destination</span><strong>runtime selected</strong></div>
-        {/if}
-      </div>
-      <p class="note">
-        NAP-UPLOAD does not disclose the target Blossom server list before upload, so this can only show destinations after the runtime returns URLs.
-      </p>
-    </article>
-
-    <article>
-      <h2>Outbox publish</h2>
-      <div class="rows">
-        {#if publishedEvent}
-          <div class="row ok"><span>{shortHash(publishedEvent.id)}</span><strong>signed</strong></div>
-        {/if}
-        {#if publishRelayHints.length > 0}
+        </div>
+        <p class="note">NAP-UPLOAD doesn't say which server it'll use up front, so destinations show once the runtime returns URLs.</p>
+      </article>
+      <article>
+        <h3>Manifest publish</h3>
+        <div class="rows">
+          {#if publishedEvent}
+            <div class="row ok"><span>{shortHash(publishedEvent.id)}</span><strong>signed</strong></div>
+          {/if}
           {#each publishRelayHints as url}
             <div class="row ok"><span>{url}</span><strong>accepted</strong></div>
+          {:else}
+            {#each relays as row}
+              <div class="row"><span>{row.url}</span><strong>{row.mode}</strong></div>
+            {:else}
+              <div class="row"><span>Your write relays</span><strong>outbox picks</strong></div>
+            {/each}
           {/each}
-        {:else if relays.length > 0}
-          {#each relays as row}
-            <div class="row pending"><span>{row.url}</span><strong>{row.mode}</strong></div>
-          {/each}
-        {:else}
-          <div class="row pending"><span>Write relays</span><strong>outbox selected</strong></div>
-        {/if}
-      </div>
-      <p class="note">
-        NAP-OUTBOX owns relay selection and returns the publish relay map used as NIP-19 relay hints.
-      </p>
-    </article>
-
-    <article class="wide">
-      <h2>Result</h2>
-      {#if resultRows.length > 0}
-        <dl class="facts result">
-          {#each resultRows as row}
-            <div class:primary-result={row.primary}>
-              <dt>{row.label}</dt>
-              <dd title={row.value || row.display}>{row.display}</dd>
-              <button
-                type="button"
-                class="copy-button"
-                disabled={!row.value}
-                title="Copy {row.label}"
-                aria-label="Copy {row.label}"
-                onclick={() => { void copyResult(row); }}
-              >{copiedResultId === row.id ? 'Copied' : 'Copy'}</button>
-            </div>
-          {/each}
-        </dl>
-      {:else}
-        <p class="empty">Deploy a built napplet to see the manifest address and blob URL.</p>
-      {/if}
-    </article>
-  </section>
+        </div>
+        <p class="note">NAP-OUTBOX owns relay selection, and returns the relays it used as hints for the NIP-19 entity.</p>
+      </article>
+    </div>
+  </details>
 </main>
 
 <style>
   :global(body) {
     margin: 0;
-    background: #090b0b;
-    color: #efece3;
-    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--hg-bg-base);
+    color: var(--hg-text-primary);
+    font: 13px/1.45 var(--hg-font-body);
   }
 
   main {
     min-height: 100vh;
     box-sizing: border-box;
-    padding: 16px;
+    padding: 14px 16px;
     display: flex;
     flex-direction: column;
-    gap: 14px;
-  }
-
-  .topbar {
-    display: flex;
-    justify-content: space-between;
-    gap: 12px;
-    align-items: start;
-    border-bottom: 1px solid #28302c;
-    padding-bottom: 12px;
-  }
-
-  h1, h2, p {
-    margin: 0;
-  }
-
-  h1 {
-    font-size: 24px;
-    font-weight: 720;
-  }
-
-  h2 {
-    font-size: 13px;
-    text-transform: uppercase;
-    color: #d8d1c2;
-  }
-
-  .eyebrow, .note, .empty {
-    color: #918b7e;
-    font-size: 11px;
-  }
-
-  .runtime {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-    gap: 6px;
-  }
-
-  .runtime span, .step {
-    border: 1px solid #3a3328;
-    color: #d8a550;
-    padding: 4px 8px;
-    border-radius: 4px;
-    font-size: 10px;
-    text-transform: uppercase;
-  }
-
-  .runtime .ok, .step.success {
-    border-color: #33583a;
-    color: #8ed982;
-  }
-
-  .workspace {
-    display: grid;
-    grid-template-columns: minmax(280px, 1.15fr) minmax(280px, 0.85fr);
-    gap: 12px;
-    min-height: 360px;
-  }
-
-  .dropzone, .panel, article {
-    border: 1px solid #28302c;
-    background: #111614;
-    border-radius: 6px;
-  }
-
-  .dropzone {
-    display: grid;
-    align-content: center;
-    justify-items: center;
-    gap: 12px;
-    padding: 28px;
-    text-align: center;
-    border-style: dashed;
-  }
-
-  .dropzone.active {
-    border-color: #8ed982;
-    background: #152018;
-  }
-
-  .drop-mark {
-    width: min(260px, 80%);
-    aspect-ratio: 1.8;
-    display: grid;
-    place-items: center;
-    border: 1px solid #435046;
-    background: #080a09;
-    color: #8ed982;
-    border-radius: 4px;
-    box-shadow: inset 0 0 0 1px #0f1712;
-  }
-
-  .dropzone h2 {
-    font-size: 20px;
-    text-transform: none;
-    color: #efece3;
-  }
-
-  .dropzone p {
-    max-width: 430px;
-    color: #aca596;
-  }
-
-  .drop-actions, .panel-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-  }
-
-  button {
-    min-height: 32px;
-    border: 1px solid #435046;
-    background: #18201c;
-    color: #efece3;
-    border-radius: 4px;
-    padding: 0 12px;
-    font: inherit;
-    cursor: pointer;
-  }
-
-  button:hover:not(:disabled) {
-    border-color: #8ed982;
-  }
-
-  button:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-  }
-
-  .primary, .deploy {
-    border-color: #8ed982;
-    color: #8ed982;
-  }
-
-  .secondary {
-    color: #aca596;
-  }
-
-  .panel {
-    padding: 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  label {
-    display: grid;
-    gap: 4px;
-  }
-
-  label span, dt {
-    color: #918b7e;
-    font-size: 10px;
-    text-transform: uppercase;
-  }
-
-  input, textarea {
-    box-sizing: border-box;
-    width: 100%;
-    min-width: 0;
-    border: 1px solid #303832;
-    background: #090b0b;
-    color: #efece3;
-    border-radius: 4px;
-    padding: 8px;
-    font: inherit;
-  }
-
-  textarea {
-    min-height: 66px;
-    resize: vertical;
-  }
-
-  input:focus, textarea:focus {
-    outline: none;
-    border-color: #8ed982;
-  }
-
-  .invalid {
-    border-color: #cc5f4d;
-  }
-
-  .facts {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-    margin: 0;
-  }
-
-  .facts div {
-    min-width: 0;
-    border: 1px solid #28302c;
-    border-radius: 4px;
-    padding: 8px;
-    background: #0c100e;
-  }
-
-  .result div {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    align-items: end;
-    gap: 2px 8px;
-  }
-
-  .result .primary-result {
-    grid-column: 1 / -1;
-    border-color: #3d6644;
-    background: #0d1711;
-  }
-
-  .result dt,
-  .result dd {
-    min-width: 0;
-  }
-
-  .result dd {
-    grid-column: 1;
-  }
-
-  .copy-button {
-    grid-column: 2;
-    grid-row: 1 / span 2;
-    min-height: 26px;
-    align-self: center;
-    padding: 0 9px;
-    color: #8ed982;
-    font-size: 10px;
-    text-transform: uppercase;
-  }
-
-  dd {
-    margin: 2px 0 0;
-    overflow-wrap: anywhere;
-  }
-
-  .status {
-    color: #aca596;
-    font-size: 11px;
-  }
-
-  .error {
-    margin: 0;
-    color: #ff8a75;
-    font-size: 11px;
-  }
-
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 12px;
   }
 
-  article {
-    padding: 12px;
-    display: grid;
-    gap: 10px;
-    align-content: start;
-  }
+  h1, h2, h3, p { margin: 0; }
+  h1 { font: 600 20px/1.2 var(--hg-font-title, var(--hg-font-body)); }
+  h2 { font-size: 14px; font-weight: 600; }
+  h3 { font-size: 12px; font-weight: 600; }
+  .lede, .note { color: var(--hg-text-muted); }
+  .note { font-size: 12px; }
 
-  .wide {
-    grid-column: 1 / -1;
-  }
+  .topbar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: start; gap: 8px 12px; }
+  .runtime { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 0; padding: 0; list-style: none; color: var(--hg-text-muted); font-size: 12px; }
+  .runtime li::before { content: ''; display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: var(--hg-accent-warning); }
+  .runtime li.ok::before { background: var(--hg-accent-success); }
 
-  .rows {
-    display: grid;
-    gap: 6px;
-  }
+  .steps { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 0; padding: 8px 10px; list-style: none; border: 1px solid var(--hg-border-default); border-radius: 6px; background: var(--hg-bg-surface); color: var(--hg-text-muted); }
+  .steps li { display: flex; align-items: center; gap: 6px; }
+  .steps li.current { color: var(--hg-text-primary); font-weight: 600; }
+  .step-number { display: inline-grid; place-items: center; width: 18px; height: 18px; border: 1px solid var(--hg-border-default); border-radius: 50%; font-size: 11px; }
+  .steps li.current .step-number { border-color: var(--hg-accent-primary); color: var(--hg-accent-primary); }
+  .steps li.done .step-number { border-color: var(--hg-accent-success); color: var(--hg-accent-success); }
 
-  .row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 8px;
-    align-items: center;
-    min-height: 30px;
-    border: 1px solid #28302c;
-    border-radius: 4px;
-    padding: 0 8px;
-    background: #0c100e;
-  }
+  .workspace { display: grid; grid-template-columns: minmax(240px, .8fr) minmax(300px, 1.2fr); gap: 12px; align-items: start; }
 
-  .row span {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
+  .dropzone, .panel, article { border: 1px solid var(--hg-border-default); background: var(--hg-bg-surface); border-radius: 6px; }
 
-  .row strong {
-    color: #918b7e;
-    font-size: 10px;
-    text-transform: uppercase;
-  }
+  .dropzone { display: grid; justify-items: center; gap: 10px; padding: 28px 18px; text-align: center; border-style: dashed; }
+  .dropzone.active { border-color: var(--hg-accent-primary); background: color-mix(in srgb, var(--hg-accent-primary) 8%, var(--hg-bg-surface)); }
+  .dropzone.has-file { border-style: solid; padding-block: 18px; }
+  .dropzone h2 { overflow-wrap: anywhere; }
+  .dropzone p { color: var(--hg-text-muted); }
+  .dropzone code { color: var(--hg-text-primary); }
+  .drop-actions, .panel-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+  .drop-actions { justify-content: center; }
 
-  .row.ok strong {
-    color: #8ed982;
-  }
+  button { padding: 6px 12px; border: 1px solid var(--hg-border-default); border-radius: 4px; color: var(--hg-text-primary); background: var(--hg-bg-elevated); font: inherit; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--hg-accent-primary); }
+  button:disabled { cursor: default; opacity: .5; }
+  button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid var(--hg-accent-primary); outline-offset: 1px; }
+  .primary, .deploy { border-color: var(--hg-accent-primary); color: var(--hg-accent-primary); background: color-mix(in srgb, var(--hg-accent-primary) 12%, var(--hg-bg-elevated)); font-weight: 600; }
 
-  .row.pending strong {
-    color: #d8a550;
-  }
+  .panel { display: grid; gap: 10px; padding: 12px; min-width: 0; }
+  label { display: grid; gap: 3px; }
+  label > span { color: var(--hg-text-muted); font-size: 12px; }
+  label small { color: var(--hg-text-muted); font-size: 11px; }
+  input, textarea { box-sizing: border-box; width: 100%; padding: 6px 8px; border: 1px solid var(--hg-border-default); border-radius: 4px; color: var(--hg-text-primary); background: var(--hg-bg-base); font: inherit; }
+  input::placeholder, textarea::placeholder { color: var(--hg-text-muted); opacity: .75; }
+  textarea { resize: vertical; }
+  .invalid { border-color: var(--hg-accent-danger); }
+  label small.field-error, .dropzone p.error { color: var(--hg-accent-danger); }
+  .hidden-file { display: none; }
 
-  .hidden-file {
-    display: none;
-  }
+  .requires { font-size: 12px; }
+  .requires span { color: var(--hg-text-muted); margin-right: 4px; }
+  .hashes summary, .where summary { cursor: pointer; color: var(--hg-text-muted); }
+  .where summary { font-weight: 600; }
+  .deploy { padding-block: 8px; }
+  .status { color: var(--hg-text-muted); font-size: 12px; }
 
-  @media (max-width: 820px) {
-    .workspace, .grid {
-      grid-template-columns: 1fr;
-    }
+  .failure { display: grid; gap: 3px; padding: 8px 10px; border: 1px solid var(--hg-accent-danger); border-radius: 4px; background: color-mix(in srgb, var(--hg-accent-danger) 10%, var(--hg-bg-surface)); }
+  .failure strong { color: var(--hg-accent-danger); }
+  .failure small { color: var(--hg-text-muted); font-size: 11px; overflow-wrap: anywhere; }
 
-    .topbar {
-      flex-direction: column;
-    }
+  .facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin: 6px 0 0; }
+  .facts div { min-width: 0; padding: 6px 8px; border: 1px solid var(--hg-border-default); border-radius: 4px; background: var(--hg-bg-base); }
+  dt { color: var(--hg-text-muted); font-size: 11px; }
+  dd { margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 
-    .runtime {
-      justify-content: flex-start;
-    }
+  .result-panel { border-color: var(--hg-accent-success); }
+  .result { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .result div { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; align-items: center; }
+  .result dt { grid-column: 1; }
+  .result dd { grid-column: 1; }
+  .result .copy-button { grid-column: 2; grid-row: 1 / span 2; padding: 3px 8px; font-size: 12px; }
+  .result .primary-result { grid-column: 1 / -1; border-color: var(--hg-accent-success); }
+
+  .where { display: block; }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+  article { display: grid; gap: 8px; padding: 10px; background: var(--hg-bg-base); min-width: 0; }
+  .rows { display: grid; gap: 4px; }
+  .row { display: flex; justify-content: space-between; gap: 8px; min-width: 0; }
+  .row span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .row strong { flex: 0 0 auto; color: var(--hg-text-muted); font-size: 11px; font-weight: 500; }
+  .row.ok strong { color: var(--hg-accent-success); }
+
+  @media (max-width: 760px) {
+    .workspace, .grid { grid-template-columns: minmax(0, 1fr); }
+    .facts, .result { grid-template-columns: minmax(0, 1fr); }
   }
 </style>

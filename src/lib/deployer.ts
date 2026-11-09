@@ -56,10 +56,10 @@ export interface NappletPublisher {
 }
 
 export function validateHtmlFile(file: File, maxBytes?: number): string | null {
-  if (file.size === 0) return 'HTML file is empty';
-  if (maxBytes !== undefined && file.size > maxBytes) return `HTML file exceeds runtime limit (${formatBytes(maxBytes)})`;
-  if (!file.name.toLowerCase().endsWith('.html')) return 'Choose the built napplet index.html file';
-  if (file.type && file.type !== 'text/html') return `Unexpected MIME type: ${file.type}`;
+  if (file.size === 0) return `${file.name} is empty. Build your app and choose its index.html.`;
+  if (maxBytes !== undefined && file.size > maxBytes) return `${file.name} exceeds the runtime limit of ${formatBytes(maxBytes)}. Single-file apps need to fit under it.`;
+  if (!file.name.toLowerCase().endsWith('.html')) return `${file.name} isn't an HTML file. Choose the index.html from your app's build output, usually dist/.`;
+  if (file.type && file.type !== 'text/html') return `${file.name} has the type ${file.type}, not text/html. Choose the index.html from your app's build output.`;
   return null;
 }
 
@@ -296,3 +296,74 @@ function readFileBytes(file: File): Promise<ArrayBuffer> {
 function cssEscape(value: string): string {
   return value.replace(/["\\]/g, '\\$&');
 }
+
+export interface DeployFailure {
+  title: string;
+  hint: string;
+  detail: string;
+}
+
+/** Say what went wrong and what to do, keeping the runtime's own words for debugging. */
+export function describeDeployFailure(cause: unknown, uploaded: boolean): DeployFailure {
+  const detail = cause instanceof Error ? cause.message : String(cause ?? 'Deploy failed');
+  if (/no server configured/i.test(detail)) {
+    return {
+      title: 'No Blossom server is set up',
+      hint: 'Uploads go to your Blossom server list. Add a server in Blossom settings, then deploy again.',
+      detail,
+    };
+  }
+  if (/read-?only/i.test(detail)) {
+    return {
+      title: 'This account is read-only',
+      hint: 'Deploying signs events. Sign in with a browser extension or remote signer, then deploy again.',
+      detail,
+    };
+  }
+  if (/hash mismatch/i.test(detail)) {
+    return {
+      title: "The server's copy doesn't match your file",
+      hint: "The manifest wasn't published, because it would point at different bytes. Try again, or try another Blossom server.",
+      detail,
+    };
+  }
+  if (/denied|rejected|declined|blocked/i.test(detail)) {
+    return {
+      title: uploaded ? 'The upload worked, but publishing was denied' : 'The upload was denied',
+      hint: uploaded
+        ? 'Your file is on the server, but the manifest was not published. Deploy again and allow the publish when asked.'
+        : 'Nothing was published. Deploy again and allow it when asked.',
+      detail,
+    };
+  }
+  return uploaded
+    ? {
+      title: 'The upload worked, but publishing failed',
+      hint: 'Your file is on the server, but the manifest was not published. Check your relays and deploy again.',
+      detail,
+    }
+    : {
+      title: 'The upload failed',
+      hint: 'Nothing was published. Check your Blossom servers and deploy again.',
+      detail,
+    };
+}
+
+export type DeployBlocker = 'no-file' | 'file-error' | 'missing-d-tag' | 'invalid-d-tag' | 'busy' | null;
+
+/** Why Deploy is off, so the button never just sits there disabled. */
+export function deployBlocker(input: { hasFile: boolean; prepared: boolean; dTag: string; busy: boolean }): DeployBlocker {
+  if (input.busy) return 'busy';
+  if (!input.hasFile) return 'no-file';
+  if (!input.prepared) return 'file-error';
+  const dTag = input.dTag.trim();
+  if (!dTag) return 'missing-d-tag';
+  return NAPPLET_DTAG_RE.test(dTag) ? null : 'invalid-d-tag';
+}
+
+export const DEPLOY_BLOCKER_TEXT: Record<Exclude<DeployBlocker, null | 'busy'>, string> = {
+  'no-file': 'Choose a file to deploy.',
+  'file-error': 'Choose a valid index.html to deploy.',
+  'missing-d-tag': "This file has no napplet-type, so enter a d-tag above.",
+  'invalid-d-tag': 'Fix the d-tag above to deploy.',
+};

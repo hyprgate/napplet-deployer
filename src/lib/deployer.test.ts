@@ -3,6 +3,8 @@ import type { EventTemplate, NostrEvent, UploadResult } from '@napplet/sdk';
 import * as nip19 from 'nostr-tools/nip19';
 import {
   DEPLOYER_CLIENT_TAG,
+  deployBlocker,
+  describeDeployFailure,
   NAPPLET_INDEX_PATH,
   buildNappletManifestTemplate,
   computeSingleFileAggregateHash,
@@ -220,5 +222,32 @@ describe('deployNappletHtml', () => {
 
     await expect(deployNappletHtml({ file: file() }, { uploader, publisher })).rejects.toThrow(/hash mismatch/);
     expect(publisher.publish).not.toHaveBeenCalled();
+  });
+});
+
+describe('deploy guidance', () => {
+  it('turns runtime failures into what to do next, keeping the original words', () => {
+    expect(describeDeployFailure(new Error('no server configured'), false)).toMatchObject({
+      title: 'No Blossom server is set up',
+      detail: 'no server configured',
+    });
+    expect(describeDeployFailure(new Error('Cant sign events with readonly'), false).title).toBe('This account is read-only');
+    expect(describeDeployFailure(new Error('Upload hash mismatch: a != b'), true).hint).toContain("wasn't published");
+  });
+
+  it('says whether the file got uploaded when a later step fails', () => {
+    expect(describeDeployFailure(new Error('publish denied by user'), true).title).toBe('The upload worked, but publishing was denied');
+    expect(describeDeployFailure(new Error('relay down'), true).title).toBe('The upload worked, but publishing failed');
+    expect(describeDeployFailure(new Error('network'), false).title).toBe('The upload failed');
+  });
+
+  it('gives the reason Deploy is off', () => {
+    const ready = { hasFile: true, prepared: true, dTag: 'tide-clock', busy: false };
+    expect(deployBlocker(ready)).toBeNull();
+    expect(deployBlocker({ ...ready, hasFile: false, prepared: false })).toBe('no-file');
+    expect(deployBlocker({ ...ready, prepared: false })).toBe('file-error');
+    expect(deployBlocker({ ...ready, dTag: '  ' })).toBe('missing-d-tag');
+    expect(deployBlocker({ ...ready, dTag: 'Tide Clock!' })).toBe('invalid-d-tag');
+    expect(deployBlocker({ ...ready, busy: true })).toBe('busy');
   });
 });
